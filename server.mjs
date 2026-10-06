@@ -21,7 +21,6 @@ const meals = new Map([
   ['10', ['BUTTER GARLIC NOODLES', 'Velvety butter garlic coating with cracked black pepper and green scallions']]
 ]);
 const submitted = new Map();
-const roster = new Set((process.env.FACULTY_ROSTER_NAMES || '').split(',').map(normalize).filter(Boolean));
 
 function normalize(value = '') { return value.trim().replace(/\s+/g, ' ').toUpperCase(); }
 function token(bytes = 24) { return randomBytes(bytes).toString('base64url'); }
@@ -88,7 +87,7 @@ createServer(async (req, res) => {
     }
     if (url.pathname === '/api/faculty/verify' && req.method === 'POST') {
       const { name } = await body(req); const key = normalize(name);
-      if (!key || !roster.has(key)) return send(res, 403, { error: 'ROSTER QUERY NEGATIVE. Faculty identity not authorized.' });
+      if (!key) return send(res, 400, { error: 'Enter a faculty name to continue.' });
       login(res, 'FACULTY', `faculty:${key}`, { name: key }); return send(res, 200, { ok: true, name: key });
     }
     if (url.pathname === '/api/submit' && req.method === 'POST') {
