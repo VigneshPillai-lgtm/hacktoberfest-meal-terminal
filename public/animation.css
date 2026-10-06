@@ -1,0 +1,14 @@
+.pac-runner {
+  animation: pacman-chase 2.8s linear infinite;
+  will-change: transform;
+}
+
+@keyframes pacman-chase {
+  from { transform: translateX(0); }
+  92% { transform: translateX(clamp(120px, calc(100vw - 184px), 230px)); }
+  93%, 100% { transform: translateX(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pac-runner { animation-duration: 3.8s; }
+}

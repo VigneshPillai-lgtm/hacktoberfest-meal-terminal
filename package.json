@@ -1,0 +1,8 @@
+{
+  "name": "hacktoberfest-26-meal-terminal",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node --env-file=.env server.mjs", "dev": "node --env-file=.env --watch server.mjs" },
+  "engines": { "node": ">=20" }
+}
