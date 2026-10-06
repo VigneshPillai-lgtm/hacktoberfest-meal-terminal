@@ -6,8 +6,6 @@ import { join, extname } from 'node:path';
 const port = Number(process.env.PORT || 3000);
 const origin = process.env.APP_ORIGIN || `http://localhost:${port}`;
 const root = join(process.cwd(), 'public');
-const sessions = new Map();
-const states = new Map();
 const inFlightSubmissions = new Set();
 const sessionSecret = process.env.SESSION_SECRET || token(32);
 const meals = new Map([
@@ -27,19 +25,28 @@ const roster = new Set((process.env.FACULTY_ROSTER_NAMES || '').split(',').map(n
 
 function normalize(value = '') { return value.trim().replace(/\s+/g, ' ').toUpperCase(); }
 function token(bytes = 24) { return randomBytes(bytes).toString('base64url'); }
+function sign(value) { return createHmac('sha256', sessionSecret).update(value).digest('base64url'); }
 function send(res, status, data, headers = {}) { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...headers }); res.end(JSON.stringify(data)); }
-function signature(id) { return createHmac('sha256', sessionSecret).update(id).digest('base64url'); }
-function cookie(req) {
-  const value = (req.headers.cookie || '').split(';').map(v => v.trim()).find(v => v.startsWith('hack_session='))?.slice(13);
-  if (!value) return null; const [id, sig] = value.split('.'); return id && sig && safeEqual(sig, signature(id)) ? id : null;
+function cookie(req, name) {
+  return (req.headers.cookie || '').split(';').map(value => value.trim()).find(value => value.startsWith(`${name}=`))?.slice(name.length + 1);
 }
-function session(req) { return sessions.get(cookie(req)); }
+function session(req) {
+  const value = cookie(req, 'hack_session');
+  if (!value) return null;
+  const [payload, signature] = value.split('.');
+  if (!payload || !signature || !safeEqual(signature, sign(payload))) return null;
+  try {
+    const result = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    return result.expiresAt > Date.now() ? result : null;
+  } catch { return null; }
+}
 function safeEqual(a, b) { const x = Buffer.from(a); const y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); }
-function ensureSession(req, res) {
-  const existing = cookie(req); if (existing && sessions.has(existing)) return [existing, sessions.get(existing)];
-  const id = token(); const value = {}; sessions.set(id, value);
-  res.setHeader('set-cookie', `hack_session=${id}.${signature(id)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=14400${origin.startsWith('https:') ? '; Secure' : ''}`);
-  return [id, value];
+function secureCookie() { return origin.startsWith('https:') ? '; Secure' : ''; }
+function oauthStateCookie(state) { return `oauth_state=${state}.${sign(state)}; HttpOnly; SameSite=Lax; Path=/auth/github/callback; Max-Age=600${secureCookie()}`; }
+function clearOauthStateCookie() { return `oauth_state=; HttpOnly; SameSite=Lax; Path=/auth/github/callback; Max-Age=0${secureCookie()}`; }
+function sessionCookie(value) {
+  const payload = Buffer.from(JSON.stringify({ ...value, expiresAt: Date.now() + 14400000 })).toString('base64url');
+  return `hack_session=${payload}.${sign(payload)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=14400${secureCookie()}`;
 }
 async function body(req) { let raw = ''; for await (const part of req) { raw += part; if (raw.length > 15000) throw Error('Request too large'); } try { return JSON.parse(raw || '{}'); } catch { throw Error('Invalid JSON'); } }
 function identityOf(s) { return s?.identity && s?.role ? s.identity : null; }
@@ -51,7 +58,9 @@ async function sheets(payload) {
   const result = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
   if (!result.ok) throw Error('Recording endpoint rejected the selection.');
 }
-function login(sessionValue, role, identity, github = null) { sessionValue.role = role; sessionValue.identity = identity; sessionValue.github = github; }
+function login(res, role, identity, github = null, additionalCookies = []) {
+  res.setHeader('set-cookie', [sessionCookie({ role, identity, github }), ...additionalCookies]);
+}
 
 createServer(async (req, res) => {
   const url = new URL(req.url, origin);
@@ -59,25 +68,28 @@ createServer(async (req, res) => {
     if (url.pathname === '/api/session') { const s = session(req); return send(res, 200, { authenticated: Boolean(identityOf(s)), role: s?.role, identity: s?.identity, github: s?.github }); }
     if (url.pathname === '/auth/github' && req.method === 'GET') {
       if (!process.env.GITHUB_CLIENT_ID || !process.env.GITHUB_CLIENT_SECRET) return send(res, 503, { error: 'GitHub OAuth is not configured.' });
-      const [, s] = ensureSession(req, res); const state = token(); states.set(state, { session: s, expires: Date.now() + 600000 });
+      const state = token(); res.setHeader('set-cookie', oauthStateCookie(state));
       const callback = process.env.GITHUB_REDIRECT_URI || `${origin}/auth/github/callback`;
       res.writeHead(302, { location: `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(process.env.GITHUB_CLIENT_ID)}&redirect_uri=${encodeURIComponent(callback)}&scope=read:user&state=${state}` }); return res.end();
     }
     if (url.pathname === '/auth/github/callback' && req.method === 'GET') {
-      const entry = states.get(url.searchParams.get('state')); states.delete(url.searchParams.get('state'));
-      if (!entry || entry.expires < Date.now() || !url.searchParams.get('code')) { res.writeHead(302, { location: '/?auth=failed' }); return res.end(); }
+      const returnedState = url.searchParams.get('state');
+      const stateCookie = cookie(req, 'oauth_state');
+      const [storedState, stateSignature] = stateCookie?.split('.') || [];
+      const stateIsValid = returnedState && storedState === returnedState && stateSignature && safeEqual(stateSignature, sign(storedState));
+      if (!stateIsValid || !url.searchParams.get('code')) { res.setHeader('set-cookie', clearOauthStateCookie()); res.writeHead(302, { location: '/?auth=failed' }); return res.end(); }
       const callback = process.env.GITHUB_REDIRECT_URI || `${origin}/auth/github/callback`;
       const exchange = await fetch('https://github.com/login/oauth/access_token', { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify({ client_id: process.env.GITHUB_CLIENT_ID, client_secret: process.env.GITHUB_CLIENT_SECRET, code: url.searchParams.get('code'), redirect_uri: callback }) });
       const credential = await exchange.json(); if (!credential.access_token) throw Error('GitHub code exchange failed.');
       const profileResponse = await fetch('https://api.github.com/user', { headers: { authorization: `Bearer ${credential.access_token}`, 'user-agent': 'hacktoberfest-meal-terminal', accept: 'application/vnd.github+json' } });
       const profile = await profileResponse.json(); if (!profileResponse.ok || !profile.id || !profile.login) throw Error('GitHub profile verification failed.');
-      login(entry.session, 'STUDENT', `github:${profile.id}`, { login: profile.login, name: profile.name || profile.login });
+      login(res, 'STUDENT', `github:${profile.id}`, { login: profile.login, name: profile.name || profile.login }, [clearOauthStateCookie()]);
       res.writeHead(302, { location: '/#/meal-matrix' }); return res.end();
     }
     if (url.pathname === '/api/faculty/verify' && req.method === 'POST') {
-      const [, s] = ensureSession(req, res); const { name } = await body(req); const key = normalize(name);
+      const { name } = await body(req); const key = normalize(name);
       if (!key || !roster.has(key)) return send(res, 403, { error: 'ROSTER QUERY NEGATIVE. Faculty identity not authorized.' });
-      login(s, 'FACULTY', `faculty:${key}`, { name: key }); return send(res, 200, { ok: true, name: key });
+      login(res, 'FACULTY', `faculty:${key}`, { name: key }); return send(res, 200, { ok: true, name: key });
     }
     if (url.pathname === '/api/submit' && req.method === 'POST') {
       const s = session(req); const identity = identityOf(s); if (!identity) return send(res, 401, { error: 'Identity verification required.' });
@@ -88,7 +100,7 @@ createServer(async (req, res) => {
       try { await sheets(record); submitted.set(identity, record); return send(res, 201, { ok: true, record }); }
       finally { inFlightSubmissions.delete(identity); }
     }
-    if (url.pathname === '/api/logout' && req.method === 'POST') { sessions.delete(cookie(req)); return send(res, 200, { ok: true }, { 'set-cookie': 'hack_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0' }); }
+    if (url.pathname === '/api/logout' && req.method === 'POST') { return send(res, 200, { ok: true }, { 'set-cookie': `hack_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secureCookie()}` }); }
     if (req.method === 'GET') {
       const requested = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
       if (requested.includes('..')) throw Error('Not found');
