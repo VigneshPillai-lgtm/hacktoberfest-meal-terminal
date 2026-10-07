@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { readFile, mkdir, appendFile } from 'node:fs/promises';
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { join, extname } from 'node:path';
 
 const port = Number(process.env.PORT || 3000);
@@ -23,6 +23,8 @@ const meals = new Map([
 const submitted = new Map();
 
 function normalize(value = '') { return value.trim().replace(/\s+/g, ' ').toUpperCase(); }
+function normalizeRollNumber(value = '') { return String(value).trim().toUpperCase(); }
+function validRollNumber(value) { return /^[A-Z0-9-]{4,20}$/.test(value); }
 function token(bytes = 24) { return randomBytes(bytes).toString('base64url'); }
 function sign(value) { return createHmac('sha256', sessionSecret).update(value).digest('base64url'); }
 function send(res, status, data, headers = {}) { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...headers }); res.end(JSON.stringify(data)); }
@@ -41,7 +43,25 @@ function session(req) {
 }
 function safeEqual(a, b) { const x = Buffer.from(a); const y = Buffer.from(b); return x.length === y.length && timingSafeEqual(x, y); }
 function secureCookie() { return origin.startsWith('https:') ? '; Secure' : ''; }
-function oauthStateCookie(state) { return `oauth_state=${state}.${sign(state)}; HttpOnly; SameSite=Lax; Path=/auth/github/callback; Max-Age=600${secureCookie()}`; }
+function oauthStateCookie(state, rollNumber) {
+  const iv = randomBytes(12);
+  const key = createHash('sha256').update(sessionSecret).digest();
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(JSON.stringify({ state, rollNumber }), 'utf8'), cipher.final()]);
+  const payload = Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString('base64url');
+  return `oauth_state=${payload}; HttpOnly; SameSite=Lax; Path=/auth/github/callback; Max-Age=600${secureCookie()}`;
+}
+function readOauthState(value) {
+  try {
+    const packed = Buffer.from(value, 'base64url');
+    if (packed.length <= 28) return null;
+    const key = createHash('sha256').update(sessionSecret).digest();
+    const decipher = createDecipheriv('aes-256-gcm', key, packed.subarray(0, 12));
+    decipher.setAuthTag(packed.subarray(12, 28));
+    const decoded = Buffer.concat([decipher.update(packed.subarray(28)), decipher.final()]).toString('utf8');
+    return JSON.parse(decoded);
+  } catch { return null; }
+}
 function clearOauthStateCookie() { return `oauth_state=; HttpOnly; SameSite=Lax; Path=/auth/github/callback; Max-Age=0${secureCookie()}`; }
 function sessionCookie(value) {
   const payload = Buffer.from(JSON.stringify({ ...value, expiresAt: Date.now() + 14400000 })).toString('base64url');
@@ -65,24 +85,26 @@ createServer(async (req, res) => {
   const url = new URL(req.url, origin);
   try {
     if (url.pathname === '/api/session') { const s = session(req); return send(res, 200, { authenticated: Boolean(identityOf(s)), role: s?.role, identity: s?.identity, github: s?.github }); }
-    if (url.pathname === '/auth/github' && req.method === 'GET') {
+    if (url.pathname === '/api/student/oauth/start' && req.method === 'POST') {
       if (!process.env.GITHUB_CLIENT_ID || !process.env.GITHUB_CLIENT_SECRET) return send(res, 503, { error: 'GitHub OAuth is not configured.' });
-      const state = token(); res.setHeader('set-cookie', oauthStateCookie(state));
+      const { rollNumber: inputRollNumber } = await body(req);
+      const rollNumber = normalizeRollNumber(inputRollNumber);
+      if (!validRollNumber(rollNumber)) return send(res, 400, { error: 'Enter a valid roll number using 4–20 letters or numbers.' });
+      const state = token(); res.setHeader('set-cookie', oauthStateCookie(state, rollNumber));
       const callback = process.env.GITHUB_REDIRECT_URI || `${origin}/auth/github/callback`;
-      res.writeHead(302, { location: `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(process.env.GITHUB_CLIENT_ID)}&redirect_uri=${encodeURIComponent(callback)}&scope=read:user&state=${state}` }); return res.end();
+      return send(res, 200, { url: `https://github.com/login/oauth/authorize?client_id=${encodeURIComponent(process.env.GITHUB_CLIENT_ID)}&redirect_uri=${encodeURIComponent(callback)}&scope=read:user&state=${state}` });
     }
     if (url.pathname === '/auth/github/callback' && req.method === 'GET') {
       const returnedState = url.searchParams.get('state');
-      const stateCookie = cookie(req, 'oauth_state');
-      const [storedState, stateSignature] = stateCookie?.split('.') || [];
-      const stateIsValid = returnedState && storedState === returnedState && stateSignature && safeEqual(stateSignature, sign(storedState));
+      const stateData = readOauthState(cookie(req, 'oauth_state') || '');
+      const stateIsValid = returnedState && stateData?.state === returnedState && validRollNumber(stateData.rollNumber);
       if (!stateIsValid || !url.searchParams.get('code')) { res.setHeader('set-cookie', clearOauthStateCookie()); res.writeHead(302, { location: '/?auth=failed' }); return res.end(); }
       const callback = process.env.GITHUB_REDIRECT_URI || `${origin}/auth/github/callback`;
       const exchange = await fetch('https://github.com/login/oauth/access_token', { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json' }, body: JSON.stringify({ client_id: process.env.GITHUB_CLIENT_ID, client_secret: process.env.GITHUB_CLIENT_SECRET, code: url.searchParams.get('code'), redirect_uri: callback }) });
       const credential = await exchange.json(); if (!credential.access_token) throw Error('GitHub code exchange failed.');
       const profileResponse = await fetch('https://api.github.com/user', { headers: { authorization: `Bearer ${credential.access_token}`, 'user-agent': 'hacktoberfest-meal-terminal', accept: 'application/vnd.github+json' } });
       const profile = await profileResponse.json(); if (!profileResponse.ok || !profile.id || !profile.login) throw Error('GitHub profile verification failed.');
-      login(res, 'STUDENT', `github:${profile.id}`, { login: profile.login, name: profile.name || profile.login }, [clearOauthStateCookie()]);
+      login(res, 'STUDENT', `github:${profile.id}`, { login: profile.login, name: profile.name || profile.login, rollNumber: stateData.rollNumber }, [clearOauthStateCookie()]);
       res.writeHead(302, { location: '/#/meal-matrix' }); return res.end();
     }
     if (url.pathname === '/api/faculty/verify' && req.method === 'POST') {
@@ -94,7 +116,7 @@ createServer(async (req, res) => {
       const s = session(req); const identity = identityOf(s); if (!identity) return send(res, 401, { error: 'Identity verification required.' });
       const { mealId } = await body(req); const meal = meals.get(mealId); if (!meal) return send(res, 400, { error: 'Invalid meal selection.' });
       if (submitted.has(identity) || inFlightSubmissions.has(identity)) return send(res, 409, { error: 'A meal has already been confirmed for this identity.' });
-      const record = { timestamp: new Date().toISOString(), role: s.role, identity, githubUsername: s.github?.login || '', name: s.github?.name || s.identity.replace('faculty:', ''), mealId, meal: meal[0], status: 'CONFIRMED', token: `H26-${randomBytes(5).toString('hex').toUpperCase()}` };
+      const record = { timestamp: new Date().toISOString(), role: s.role, identity, name: s.github?.name || s.identity.replace('faculty:', ''), githubUsername: s.github?.login || '', rollNumber: s.role === 'STUDENT' ? s.github?.rollNumber || '' : '', mealId, meal: meal[0], status: 'CONFIRMED', token: `H26-${randomBytes(5).toString('hex').toUpperCase()}` };
       inFlightSubmissions.add(identity);
       try { await sheets(record); submitted.set(identity, record); return send(res, 201, { ok: true, record }); }
       finally { inFlightSubmissions.delete(identity); }

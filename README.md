@@ -10,7 +10,7 @@ Retro CRT meal-allocation terminal with two entry routes:
 
 1. Create a local `.env` file (it is intentionally excluded from Git) and set `PORT`, `APP_ORIGIN`, `SESSION_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_REDIRECT_URI`, and `GOOGLE_SHEETS_ENDPOINT`. Set `GOOGLE_SHEETS_BEARER_TOKEN` only if your endpoint requires it.
 2. Register a GitHub OAuth App. Its callback URL must exactly equal `GITHUB_REDIRECT_URI`.
-3. Set `GOOGLE_SHEETS_ENDPOINT` to your HTTPS Apps Script/webhook URL. Faculty access accepts any non-empty name, so use roster verification separately if faculty identity must be restricted. The endpoint receives a JSON record with timestamp, role, identity, GitHub username, name, meal, status, and token. No endpoint is supplied by this project.
+3. Set `GOOGLE_SHEETS_ENDPOINT` to your HTTPS Apps Script/webhook URL. Faculty access accepts any non-empty name, so use roster verification separately if faculty identity must be restricted. Student records include the submitted `rollNumber`; add a matching Roll Number column and append `data.rollNumber` in the Apps Script handler for it to appear in Sheets. The endpoint receives timestamp, role, identity, name, GitHub username, roll number, meal, status, and token. No endpoint is supplied by this project.
 4. Start the terminal:
 
    ```bash
