@@ -10,7 +10,7 @@ Retro CRT meal-allocation terminal with two entry routes:
 
 1. Create a local `.env` file (it is intentionally excluded from Git) and set `PORT`, `APP_ORIGIN`, `SESSION_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_REDIRECT_URI`, and `GOOGLE_SHEETS_ENDPOINT`. Set `GOOGLE_SHEETS_BEARER_TOKEN` only if your endpoint requires it.
 2. Register a GitHub OAuth App. Its callback URL must exactly equal `GITHUB_REDIRECT_URI`.
-3. Set `GOOGLE_SHEETS_ENDPOINT` to your HTTPS Apps Script/webhook URL. Faculty access accepts any non-empty name, so use roster verification separately if faculty identity must be restricted. Student records include the submitted `rollNumber`; add a matching Roll Number column and append `data.rollNumber` in the Apps Script handler for it to appear in Sheets. The endpoint receives timestamp, role, identity, name, GitHub username, roll number, meal, status, and token. No endpoint is supplied by this project.
+3. Set `GOOGLE_SHEETS_ENDPOINT` to your HTTPS Apps Script/webhook URL. Faculty access accepts any non-empty name, so use roster verification separately if faculty identity must be restricted. Student records include the submitted `rollNumber`; faculty records leave it blank. The endpoint receives timestamp, role, identity, name, GitHub username, roll number, meal, status, and token. No endpoint is supplied by this project.
 4. Start the terminal:
 
    ```bash
@@ -18,6 +18,12 @@ Retro CRT meal-allocation terminal with two entry routes:
    ```
 
 5. Open `http://localhost:3000`.
+
+## Google Sheets setup
+
+Create a `Meal Selections` tab and put the `Roll Number` header in column K. The current Apps Script appender leaves column J blank so each new record's roll number lands in column K. Existing rows are not changed by new submissions. When the Apps Script code changes, deploy a new version of the existing web app deployment; keep the same web app URL in `GOOGLE_SHEETS_ENDPOINT`.
+
+The application shows a successful meal confirmation only after the Sheets endpoint accepts the record. Avoid test submissions to the production sheet; use a separate test spreadsheet or deployment instead.
 
 ## Production notes
 
